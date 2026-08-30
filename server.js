@@ -291,12 +291,32 @@ const reportSchema = new mongoose.Schema(
   {
     reporter: { type: String, required: true, trim: true, index: true },
     reported: { type: String, required: true, trim: true, index: true },
+    reason: { type: String, default: "other", trim: true, index: true },
+    details: { type: String, default: "", trim: true, maxlength: 1000 },
+    source: { type: String, default: "unknown", trim: true },
+    status: {
+      type: String,
+      enum: ["pending", "reviewed", "dismissed", "action_taken"],
+      default: "pending",
+      index: true
+    },
     createdAt: { type: Date, default: Date.now }
   },
   { timestamps: true }
 );
 
 reportSchema.index({ reporter: 1, reported: 1 }, { unique: true });
+
+// حظر شخصي بين مستخدمين، وهو منفصل عن Ban الإداري.
+const userBlockSchema = new mongoose.Schema(
+  {
+    blocker: { type: String, required: true, trim: true, index: true },
+    blocked: { type: String, required: true, trim: true, index: true },
+    reason: { type: String, default: "", trim: true, maxlength: 500 }
+  },
+  { timestamps: true }
+);
+userBlockSchema.index({ blocker: 1, blocked: 1 }, { unique: true });
 
 const User = mongoose.model("User", userSchema);
 const Friendship = mongoose.model("Friendship", friendshipSchema);
@@ -328,6 +348,7 @@ const PrivateMessage = mongoose.model("PrivateMessage", privateMessageSchema);
 const RandomChatMessage = mongoose.model("RandomChatMessage", randomChatMessageSchema);
 const Ban = mongoose.model("Ban", banSchema);
 const Report = mongoose.model("Report", reportSchema);
+const UserBlock = mongoose.model("UserBlock", userBlockSchema);
 
 // ==========================================
 // 3. إدارة الحالة في الذاكرة
@@ -1346,6 +1367,56 @@ function extractTargetName(rawValue) {
   return normalizeName(rawValue);
 }
 
+const ALLOWED_REPORT_REASONS = new Set([
+  "harassment",
+  "sexual_content",
+  "spam",
+  "underage_user",
+  "child_safety",
+  "hate_or_threats",
+  "impersonation",
+  "other"
+]);
+
+function sanitizeReportReason(value) {
+  const reason = String(value || "other").trim().toLowerCase();
+  return ALLOWED_REPORT_REASONS.has(reason) ? reason : "other";
+}
+
+function sanitizeShortText(value, maxLength = 500) {
+  return String(value || "").trim().slice(0, maxLength);
+}
+
+async function getBlockBetween(userA, userB) {
+  const a = normalizeName(userA);
+  const b = normalizeName(userB);
+  if (!a || !b || a === b) return null;
+
+  return UserBlock.findOne({
+    $or: [
+      { blocker: a, blocked: b },
+      { blocker: b, blocked: a }
+    ]
+  }).lean();
+}
+
+async function areUsersBlocked(userA, userB) {
+  return Boolean(await getBlockBetween(userA, userB));
+}
+
+async function getBlockedUserIds(userName) {
+  const me = normalizeName(userName);
+  if (!me) return [];
+
+  const blocks = await UserBlock.find({
+    $or: [{ blocker: me }, { blocked: me }]
+  }).select("blocker blocked").lean();
+
+  return [...new Set(blocks.map((item) =>
+    item.blocker === me ? item.blocked : item.blocker
+  ).filter(Boolean))];
+}
+
 function acquireMatchLock(userName) {
   const cleanName = normalizeName(userName);
   if (!cleanName) return false;
@@ -2340,9 +2411,12 @@ async function banUserNow(userName, reason, durationMs, level = 1) {
   return payload;
 }
 
-async function processUserReport(reporterId, reportedUserId) {
+async function processUserReport(reporterId, reportedUserId, reportData = {}) {
   const reporter = normalizeName(reporterId);
   const reported = normalizeName(reportedUserId);
+  const reason = sanitizeReportReason(reportData?.reason);
+  const details = sanitizeShortText(reportData?.details, 1000);
+  const source = sanitizeShortText(reportData?.source, 50) || "unknown";
 
   if (!reporter || !reported || reporter === reported) {
     return { success: false, message: "Invalid data" };
@@ -2357,7 +2431,15 @@ async function processUserReport(reporterId, reportedUserId) {
     return { success: false, message: "Already reported" };
   }
 
-  await Report.create({ reporter, reported });
+  const reportedUser = await User.findOne({
+    $or: [{ userName: reported }, { userId: reported }]
+  }).select("_id").lean();
+
+  if (!reportedUser) {
+    return { success: false, message: "User not found" };
+  }
+
+  await Report.create({ reporter, reported, reason, details, source });
 
   const user = await User.findOneAndUpdate(
     { $or: [{ userName: reported }, { userId: reported }] },
@@ -2385,6 +2467,7 @@ async function processUserReport(reporterId, reportedUserId) {
     success: true,
     reports: user.reports,
     reportedUserId: reported,
+    reason,
     ban: banInfo
   };
 }
@@ -2438,7 +2521,10 @@ async function getNearbyUsersForUser(userName, maxDistanceMeters = 3000000, limi
     return [];
   }
 const friendIds = await getFriendIdsForUser(me);
-const blockedIds = new Set(friendIds.map(normalizeName));
+const blockedUserIds = await getBlockedUserIds(me);
+const excludedIds = new Set(
+  [...friendIds, ...blockedUserIds].map(normalizeName)
+);
 const ACTIVE_NEARBY_MS = 10 * 60 * 1000; // 10 دقائق
 const activeSince = new Date(Date.now() - ACTIVE_NEARBY_MS);
 
@@ -2482,7 +2568,7 @@ const users = await User.find({
     })
    .filter((user) => {
   const id = normalizeName(user.userId || user.userName);
-  return user.distanceMeters <= maxDistanceMeters && !blockedIds.has(id);
+  return user.distanceMeters <= maxDistanceMeters && !excludedIds.has(id);
 })
    .sort((a, b) => a.distanceMeters - b.distanceMeters)
 .slice(0, limit);
@@ -2564,6 +2650,12 @@ async function tryMatch(userName, requestedChatType = null) {
         }).lean();
 
         if (alreadyFriends) {
+          releaseMatchLock(candidate);
+          lockedPartner = null;
+          continue;
+        }
+
+        if (await areUsersBlocked(me, candidate)) {
           releaseMatchLock(candidate);
           lockedPartner = null;
           continue;
@@ -2846,7 +2938,11 @@ io.on("connection", (socket) => {
         });
       }
 
-      const result = await processUserReport(reporterId, reportedUserId);
+      const result = await processUserReport(reporterId, reportedUserId, {
+        reason: data?.reason,
+        details: data?.details,
+        source: data?.source || "socket"
+      });
 
       if (!result.success) {
         return socket.emit("report_result", result);
@@ -2872,6 +2968,121 @@ io.on("connection", (socket) => {
         success: false,
         message: "Failed to submit report"
       });
+    }
+  });
+
+  socket.on("block_user", async (data) => {
+    try {
+      const blocker = normalizeName(socket.data.userName);
+      const blocked = extractTargetName(data);
+      const reason = sanitizeShortText(data?.reason, 500);
+
+      if (!blocker || !blocked || blocker === blocked) {
+        return socket.emit("block_user_result", {
+          success: false,
+          message: "Invalid block data"
+        });
+      }
+
+      const targetExists = await User.exists({
+        $or: [{ userName: blocked }, { userId: blocked }]
+      });
+      if (!targetExists) {
+        return socket.emit("block_user_result", {
+          success: false,
+          message: "User not found"
+        });
+      }
+
+      await UserBlock.findOneAndUpdate(
+        { blocker, blocked },
+        { $set: { reason } },
+        { upsert: true, returnDocument: "after", setDefaultsOnInsert: true }
+      );
+
+      const relationshipKey = pairKey(blocker, blocked);
+      await Promise.all([
+        Friendship.deleteOne({ pairKey: relationshipKey }),
+        FriendRequest.deleteMany({
+          $or: [
+            { from: blocker, to: blocked },
+            { from: blocked, to: blocker }
+          ]
+        }),
+        PrivateMessage.deleteMany({ conversationKey: relationshipKey })
+      ]);
+
+      removeFromQueue(blocker);
+      removeFromQueue(blocked);
+      await clearRelationshipRuntimeState(blocker, blocked);
+      await clearCallStateForUser(blocker, "blocked");
+      await clearCallStateForUser(blocked, "blocked");
+      await clearRandomCallStateForUser(blocker, "blocked");
+      await clearRandomCallStateForUser(blocked, "blocked");
+
+      socket.emit("block_user_result", {
+        success: true,
+        blockedUserId: blocked,
+        message: "User blocked successfully"
+      });
+      socket.emit("friend_deleted_successfully", {
+        friend: blocked,
+        friendId: blocked,
+        blocked: true
+      });
+
+      await emitToUser(blocked, "blocked_by_user", {
+        userId: blocker,
+        message: "This friendship is no longer available"
+      });
+      await forceRefreshUserSocketState(blocker);
+      await forceRefreshUserSocketState(blocked);
+    } catch (err) {
+      logInfo("BLOCK", "block_user failed", err);
+      socket.emit("block_user_result", {
+        success: false,
+        message: "Failed to block user"
+      });
+    }
+  });
+
+  socket.on("unblock_user", async (data) => {
+    try {
+      const blocker = normalizeName(socket.data.userName);
+      const blocked = extractTargetName(data);
+      if (!blocker || !blocked || blocker === blocked) return;
+
+      await UserBlock.deleteOne({ blocker, blocked });
+      socket.emit("unblock_user_result", {
+        success: true,
+        blockedUserId: blocked,
+        message: "User unblocked successfully"
+      });
+    } catch (err) {
+      logInfo("BLOCK", "unblock_user failed", err);
+      socket.emit("unblock_user_result", {
+        success: false,
+        message: "Failed to unblock user"
+      });
+    }
+  });
+
+  socket.on("get_blocked_users", async () => {
+    try {
+      const me = normalizeName(socket.data.userName);
+      if (!me) return;
+      const blocks = await UserBlock.find({ blocker: me })
+        .sort({ createdAt: -1 })
+        .lean();
+
+      socket.emit("blocked_users", blocks.map((item) => ({
+        userId: item.blocked,
+        reason: item.reason || "",
+        blockedAt: item.createdAt
+      })));
+    } catch (err) {
+      logInfo("BLOCK", "get_blocked_users failed", err);
+      socket.emit("blocked_users", []);
     }
   });
 
@@ -3380,6 +3591,12 @@ if (!partner) return;
       const targetId = publicUserId(targetUser);
       if (!targetId || me === targetId) return;
 
+      if (await areUsersBlocked(me, targetId)) {
+        return socket.emit("error_msg", {
+          message: "Friend request is not allowed"
+        });
+      }
+
       const alreadyFriends = await Friendship.findOne({
         pairKey: pairKey(me, targetId)
       }).lean();
@@ -3447,6 +3664,18 @@ deleteFriendRequestAfter10Minutes(friendRequest._id);
       if (!request) return;
 
       if (accept) {
+        if (await areUsersBlocked(me, from)) {
+          await FriendRequest.deleteMany({
+            $or: [
+              { from, to: me },
+              { from: me, to: from }
+            ]
+          });
+          return socket.emit("error_msg", {
+            message: "Friend request is not allowed"
+          });
+        }
+
         request.status = "accepted";
         await request.save();
 
@@ -3623,6 +3852,10 @@ deleteFriendRequestAfter10Minutes(friendRequest._id);
         return socket.emit("private_history", []);
       }
 
+      if (await areUsersBlocked(me, other)) {
+        return socket.emit("private_history", []);
+      }
+
       const isFriend = await Friendship.findOne({
         pairKey: pairKey(me, other)
       }).lean();
@@ -3697,6 +3930,8 @@ deleteFriendRequestAfter10Minutes(friendRequest._id);
 
       if (!me || !to || me === to) return;
 
+      if (await areUsersBlocked(me, to)) return;
+
       const isFriend = await Friendship.findOne({
         pairKey: pairKey(me, to)
       }).lean();
@@ -3760,6 +3995,10 @@ deleteFriendRequestAfter10Minutes(friendRequest._id);
   if (!hasText && !hasImage && !hasAudio) return;
 
   try {
+      if (await areUsersBlocked(me, to)) {
+        return socket.emit("error_msg", { message: "User is blocked" });
+      }
+
       const isFriend = await Friendship.findOne({
         pairKey: pairKey(me, to)
       }).lean();
@@ -3844,6 +4083,10 @@ socket.on("start_private_call", async (data) => {
     const callType = data?.callType === "video" ? "video" : "audio";
 
     if (!me || !to || me === to) return;
+
+    if (await areUsersBlocked(me, to)) {
+      return socket.emit("error_msg", { message: "Call is not allowed" });
+    }
 
     const isFriend = await Friendship.findOne({
       pairKey: pairKey(me, to)
@@ -4594,6 +4837,13 @@ const nearbyUsers = await getNearbyUsersForUser(me, maxDistanceMeters, limit);
 
     const targetId = publicUserId(targetUser);
 
+    if (await areUsersBlocked(me, targetId)) {
+      return socket.emit("nearby_friend_request_result", {
+        success: false,
+        message: "لا يمكن إرسال طلب الصداقة"
+      });
+    }
+
     const alreadyFriends = await Friendship.findOne({
       pairKey: pairKey(me, targetId)
     }).lean();
@@ -4703,6 +4953,19 @@ socket.on("respond_nearby_friend_request", async (data) => {
         success: true,
         accepted: false,
         message: "تم رفض طلب الصداقة"
+      });
+    }
+
+    if (await areUsersBlocked(me, from)) {
+      await FriendRequest.deleteMany({
+        $or: [
+          { from, to: me },
+          { from: me, to: from }
+        ]
+      });
+      return socket.emit("nearby_friend_request_response", {
+        success: false,
+        message: "لا يمكن قبول طلب الصداقة"
       });
     }
 
@@ -4894,9 +5157,13 @@ app.get("/ban-status", async (req, res) => {
 
 app.post("/report-user", async (req, res) => {
   try {
-    const { reporterId, reportedUserId } = req.body;
+    const { reporterId, reportedUserId, reason, details, source } = req.body;
 
-    const result = await processUserReport(reporterId, reportedUserId);
+    const result = await processUserReport(reporterId, reportedUserId, {
+      reason,
+      details,
+      source: source || "http"
+    });
 
     if (!result.success) {
       return res.status(400).json(result);
