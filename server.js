@@ -329,6 +329,216 @@ const RandomChatMessage = mongoose.model("RandomChatMessage", randomChatMessageS
 const Ban = mongoose.model("Ban", banSchema);
 const Report = mongoose.model("Report", reportSchema);
 
+// PERSONAL BLOCKS: persistent, directional ownership; enforcement is bidirectional.
+const personalBlockSchema = new mongoose.Schema({
+  blocker: { type: String, required: true, trim: true, lowercase: true },
+  blocked: { type: String, required: true, trim: true, lowercase: true }
+}, { timestamps: true });
+personalBlockSchema.index({ blocker: 1, blocked: 1 }, { unique: true });
+personalBlockSchema.index({ blocked: 1, blocker: 1 });
+const PersonalBlock = mongoose.model("PersonalBlock", personalBlockSchema);
+
+async function isPersonalBlocked(userA, userB) {
+  const a = normalizeName(userA);
+  const b = normalizeName(userB);
+  if (!a || !b || a === b) return false;
+  return Boolean(await PersonalBlock.exists({ $or: [
+    { blocker: a, blocked: b }, { blocker: b, blocked: a }
+  ] }));
+}
+
+async function getPersonalBlockExclusions(userName) {
+  const me = normalizeName(userName);
+  if (!me) return [];
+  const rows = await PersonalBlock.find({ $or: [
+    { blocker: me }, { blocked: me }
+  ] }).select("blocker blocked").lean();
+  return [...new Set(rows.map(row => row.blocker === me ? row.blocked : row.blocker))];
+}
+
+async function clearPersonalBlockedPair(userA, userB) {
+  const a = normalizeName(userA);
+  const b = normalizeName(userB);
+  const affected = new Set();
+  const channels = new Set();
+  if (activeMatches.get(a) === b || activeMatches.get(b) === a) {
+    if (activeMatches.get(a) === b) activeMatches.delete(a);
+    if (activeMatches.get(b) === a) activeMatches.delete(b);
+    affected.add(a); affected.add(b); channels.add("match");
+  }
+  if (activeCalls.get(a)?.partner === b || activeCalls.get(b)?.partner === a) {
+    if (activeCalls.get(a)?.partner === b) activeCalls.delete(a);
+    if (activeCalls.get(b)?.partner === a) activeCalls.delete(b);
+    affected.add(a); affected.add(b); channels.add("private");
+  }
+  if (activeRandomCalls.get(a) === b || activeRandomCalls.get(b) === a) {
+    if (activeRandomCalls.get(a) === b) activeRandomCalls.delete(a);
+    if (activeRandomCalls.get(b) === a) activeRandomCalls.delete(b);
+    affected.add(a); affected.add(b); channels.add("random");
+  }
+  for (const [entries, byUser, kind] of [
+    [pendingMatches, pendingMatchByUser, "match"],
+    [pendingCalls, pendingCallByUser, "private"],
+    [pendingRandomCalls, pendingRandomCallByUser, "random"]
+  ]) {
+    for (const user of [a, b]) {
+      const key = byUser.get(user);
+      const entry = entries.get(key);
+      if (!entry) continue;
+      const first = kind === "match" ? entry.userA : entry.caller;
+      const second = kind === "match" ? entry.userB : entry.callee;
+      if (!((first === a && second === b) || (first === b && second === a))) continue;
+      if (entry.timeoutId) clearTimeout(entry.timeoutId);
+      entries.delete(key);
+      if (byUser.get(first) === key) byUser.delete(first);
+      if (byUser.get(second) === key) byUser.delete(second);
+      affected.add(first); affected.add(second); channels.add(kind);
+    }
+  }
+  clearRecentVoicePartnerPair(a, b);
+  for (const user of affected) {
+    removeFromQueue(user);
+    if (!isUserUnavailableForMatch(user)) {
+      markUserSearchStopped(user);
+      unlockUserSearch(user);
+      clearVoiceMatchGrace(user);
+    }
+  }
+  for (const [first, second] of [[a, b], [b, a]]) {
+    const key = `${pairKey(first, second)}__${first}`;
+    const timer = userTypingTimeout.get(key);
+    if (timer) clearTimeout(timer);
+    userTypingTimeout.delete(key);
+  }
+  await deletePendingFriendRequestsBetween(a, b);
+  for (const user of affected) {
+    // Existing clients already handle these events; no blocker identity disclosed.
+    if (channels.has("match")) await emitToUser(user, "match_closed", { reason: "ended" });
+    if (channels.has("private")) await emitToUser(user, "call_ended", { reason: "ended" });
+    if (channels.has("random")) await emitToUser(user, "random_call_ended", { reason: "ended" });
+  }
+}
+
+async function changePersonalBlock(actor, payload, blocking) {
+  const me = normalizeName(actor);
+  const target = normalizeName(typeof payload === "string" ? payload : (
+    payload?.blockedUserId || payload?.targetUserId || payload?.partnerId || extractTargetName(payload)
+  ));
+  if (!me || !target || me === target || target.length > 200) {
+    return { success: false, code: "INVALID_TARGET", message: "تعذر تحديد المستخدم" };
+  }
+  // IDs only: do not silently choose between users sharing a display name.
+  const user = await User.findOne({ $or: [{ userName: target }, { userId: target }] })
+    .select("userName userId").lean();
+  if (!user && blocking) return { success: false, code: "USER_NOT_FOUND", message: "المستخدم غير موجود" };
+  const targetId = user ? publicUserId(user) : target;
+  if (me === targetId) return { success: false, code: "INVALID_TARGET", message: "لا يمكنك حظر نفسك" };
+  if (blocking) {
+    try {
+      await PersonalBlock.updateOne({ blocker: me, blocked: targetId },
+        { $setOnInsert: { blocker: me, blocked: targetId } }, { upsert: true });
+    } catch (err) {
+      if (err?.code !== 11000) throw err; // Concurrent duplicate is already blocked.
+    }
+    // Persist first. A cleanup failure must not undo an effective block.
+    try { await clearPersonalBlockedPair(me, targetId); }
+    catch (err) { logInfo("BLOCK", "Pair cleanup failed after block was saved", err); }
+  } else {
+    await PersonalBlock.deleteOne({ blocker: me, blocked: targetId });
+  }
+  return { success: true, userId: targetId, blocked: blocking,
+    message: blocking ? "تم حظر المستخدم" : "تم إلغاء الحظر" };
+}
+
+function installPersonalBlockHandlers(socket) {
+  for (const [event, blocking, response] of [
+    ["block_user", true, "block_result"],
+    ["unblock_user", false, "unblock_result"]
+  ]) {
+    socket.on(event, async (payload, ack) => {
+      let result;
+      try {
+        if (!socket.data.userName) {
+          result = { success: false, code: "NOT_REGISTERED", message: "سجل الدخول أولًا" };
+        } else {
+          result = await changePersonalBlock(socket.data.userName, payload, blocking);
+        }
+      } catch (err) {
+        logInfo("BLOCK", `${event} failed`, err);
+        result = { success: false, code: "BLOCK_FAILED", message: "تعذر حفظ التغيير، حاول مجددًا" };
+      }
+      socket.emit(response, result);
+      if (typeof ack === "function") ack(result);
+    });
+  }
+  socket.on("get_blocked_users", async (_payload, ack) => {
+    let result;
+    try {
+      const me = normalizeName(socket.data.userName);
+      if (!me) throw new Error("NOT_REGISTERED");
+      const rows = await PersonalBlock.find({ blocker: me }).select("blocked createdAt").lean();
+      const profiles = await User.find({ $or: [
+        { userName: { $in: rows.map(row => row.blocked) } },
+        { userId: { $in: rows.map(row => row.blocked) } }
+      ] }).select("userName userId displayName").lean();
+      const names = new Map(profiles.map(user => [publicUserId(user), publicDisplayName(user)]));
+      result = { success: true, users: rows.map(row => ({ userId: row.blocked,
+        userName: names.get(row.blocked) || row.blocked, blockedAt: row.createdAt })) };
+    } catch (err) {
+      result = { success: false, users: [], message: "تعذر تحميل قائمة الحظر" };
+    }
+    socket.emit("blocked_users", result);
+    if (typeof ack === "function") ack(result);
+  });
+
+  const targetedEvents = new Set([
+    "private_message", "private_typing", "mark_messages_read",
+    "send_friend_request", "respond_to_request", "send_nearby_friend_request",
+    "respond_nearby_friend_request", "start_private_call", "accept_private_call",
+    "webrtc_offer", "webrtc_answer", "webrtc_ice_candidate",
+    "start_random_call", "accept_random_call", "random_webrtc_offer",
+    "random_webrtc_answer", "random_webrtc_ice_candidate"
+  ]);
+  socket.use((packet, next) => {
+    const [event, payload] = packet;
+    const isMatchEvent = event === "accept_match" || event === "message" || event === "typing";
+    if (!targetedEvents.has(event) && !isMatchEvent) return next();
+    (async () => {
+      const me = normalizeName(socket.data.userName);
+      if (!me) throw new Error("NOT_REGISTERED");
+      let target = "";
+      if (event === "accept_match") {
+        const proposal = pendingMatches.get(pendingMatchByUser.get(me));
+        if (proposal) target = proposal.userA === me ? proposal.userB : proposal.userA;
+      } else if (event === "message" || event === "typing") {
+        target = getVerifiedRandomChatPartner(me);
+      } else if (event === "respond_to_request") {
+        target = extractTargetName(payload?.fromId || payload?.from || payload);
+      } else {
+        target = extractTargetName(payload);
+        if (!target && event === "send_friend_request") target = getVerifiedRandomChatPartner(me);
+        if (!target && event === "start_random_call") {
+          target = activeMatches.get(me) || getRecentVoicePartner(me) || "";
+        }
+      }
+      if (target && await isPersonalBlocked(me, target)) {
+        const ack = packet[packet.length - 1];
+        const result = { success: false, code: "CONTACT_UNAVAILABLE", message: "التواصل مع هذا المستخدم غير متاح" };
+        socket.emit("error_msg", result);
+        if (typeof ack === "function") ack(result);
+        return; // Do not dispatch a blocked packet.
+      }
+      next();
+    })().catch(err => {
+      logInfo("BLOCK", "Contact check failed", err);
+      socket.emit("error_msg", { success: false, code: "CONTACT_CHECK_FAILED",
+        message: "تعذر التحقق من إمكانية التواصل، حاول مجددًا" });
+      // Fail closed; do not dispatch when persistence cannot be checked.
+    });
+  });
+}
+// END PERSONAL BLOCKS
+
 // ==========================================
 // 3. إدارة الحالة في الذاكرة
 // ==========================================
@@ -977,6 +1187,16 @@ async function emitToUser(userName, event, payload) {
   try {
     const socket = await getUserSocket(userName);
     if (socket) {
+      const protectedDeliveryEvents = new Set([
+        "message", "private_message_received", "partner_typing", "private_typing",
+        "new_friend_request", "nearby_friend_request_received", "incoming_call",
+        "incoming_random_call", "webrtc_offer", "webrtc_answer", "webrtc_ice_candidate",
+        "random_webrtc_offer", "random_webrtc_answer", "random_webrtc_ice_candidate"
+      ]);
+      if (protectedDeliveryEvents.has(event)) {
+        const sender = normalizeName(payload?.fromId || payload?.from);
+        if (sender && await isPersonalBlocked(sender, userName)) return false;
+      }
       socket.emit(event, payload);
       return true;
     }
@@ -1740,6 +1960,7 @@ async function activateRandomCallPair(caller, callee) {
   const a = normalizeName(caller);
   const b = normalizeName(callee);
   if (!a || !b || a === b) return false;
+  if (await isPersonalBlocked(a, b)) return false;
 
   const pendingKey = pendingRandomCallByUser.get(a) || pendingRandomCallByUser.get(b);
   if (pendingKey) {
@@ -2438,7 +2659,8 @@ async function getNearbyUsersForUser(userName, maxDistanceMeters = 3000000, limi
     return [];
   }
 const friendIds = await getFriendIdsForUser(me);
-const blockedIds = new Set(friendIds.map(normalizeName));
+const personalExclusions = await getPersonalBlockExclusions(me);
+const blockedIds = new Set([...friendIds, ...personalExclusions].map(normalizeName));
 const ACTIVE_NEARBY_MS = 10 * 60 * 1000; // 10 دقائق
 const activeSince = new Date(Date.now() - ACTIVE_NEARBY_MS);
 
@@ -2559,6 +2781,12 @@ async function tryMatch(userName, requestedChatType = null) {
       lockedPartner = candidate;
 
       try {
+        if (await isPersonalBlocked(me, candidate)) {
+          releaseMatchLock(candidate);
+          lockedPartner = null;
+          continue;
+        }
+
         const alreadyFriends = await Friendship.findOne({
           pairKey: pairKey(me, candidate)
         }).lean();
@@ -2603,6 +2831,11 @@ async function tryMatch(userName, requestedChatType = null) {
       }
     }
 
+    if (partner && await isPersonalBlocked(me, partner)) {
+      releaseMatchLock(partner);
+      lockedPartner = null;
+      partner = null;
+    }
     if (partner) {
       const key = createPendingMatchEntry(me, partner, chatType);
 
@@ -2654,6 +2887,7 @@ function socketChatTypeFromUser(socket, userName) {
 // ==========================================
 
 io.on("connection", (socket) => {
+  installPersonalBlockHandlers(socket);
   logInfo("Network", `Socket connected: ${socket.id}`);
 
   socket.on("register_user", async (rawName) => {
@@ -3898,6 +4132,10 @@ socket.on("start_private_call", async (data) => {
       );
     }
 
+    if (await isPersonalBlocked(me, to)) {
+      await clearPersonalBlockedPair(me, to);
+      return;
+    }
     targetSocket.emit("incoming_call", incomingCallPayload);
 
     socket.emit("call_ringing", {
