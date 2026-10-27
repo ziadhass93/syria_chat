@@ -291,6 +291,10 @@ const reportSchema = new mongoose.Schema(
   {
     reporter: { type: String, required: true, trim: true, index: true },
     reported: { type: String, required: true, trim: true, index: true },
+    reason: { type: String, default: "unspecified", trim: true, maxlength: 80 },
+    details: { type: String, default: "", trim: true, maxlength: 1000 },
+    context: { type: String, default: "unknown", trim: true, maxlength: 80 },
+    chatType: { type: String, default: "", trim: true, maxlength: 20 },
     createdAt: { type: Date, default: Date.now }
   },
   { timestamps: true }
@@ -2561,7 +2565,7 @@ async function banUserNow(userName, reason, durationMs, level = 1) {
   return payload;
 }
 
-async function processUserReport(reporterId, reportedUserId) {
+async function processUserReport(reporterId, reportedUserId, metadata = {}) {
   const reporter = normalizeName(reporterId);
   const reported = normalizeName(reportedUserId);
 
@@ -2569,16 +2573,42 @@ async function processUserReport(reporterId, reportedUserId) {
     return { success: false, message: "Invalid data" };
   }
 
-  const exists = await Report.findOne({
-    reporter,
-    reported
-  }).lean();
-
+  const textField = (value, fallback, max) =>
+    typeof value === "string" ? value.trim().slice(0, max) || fallback : fallback;
+  const reportData = {
+    reason: textField(metadata?.reason, "unspecified", 80),
+    details: textField(metadata?.details, "", 1000),
+    context: textField(metadata?.context, "unknown", 80),
+    chatType: textField(metadata?.chatType, "", 20)
+  };
+  const exists = await Report.findOne({ reporter, reported }).lean();
   if (exists) {
-    return { success: false, message: "Already reported" };
+    // Enrich an old incomplete report once, without counting it a second time.
+    if ((!exists.reason || exists.reason === "unspecified") &&
+        reportData.reason !== "unspecified") {
+      await Report.updateOne({
+        _id: exists._id,
+        $or: [{ reason: { $exists: false } }, { reason: "" },
+              { reason: "unspecified" }]
+      }, { $set: reportData });
+    }
+    return { success: true, alreadyReported: true, reportedUserId: reported };
   }
 
-  await Report.create({ reporter, reported });
+  // Reject nonexistent targets before creating a permanent report.
+  const targetExists = await User.exists({
+    $or: [{ userName: reported }, { userId: reported }]
+  });
+  if (!targetExists) return { success: false, message: "User not found" };
+
+  try {
+    await Report.create({ reporter, reported, ...reportData });
+  } catch (error) {
+    if (error?.code === 11000) {
+      return { success: true, alreadyReported: true, reportedUserId: reported };
+    }
+    throw error;
+  }
 
   const user = await User.findOneAndUpdate(
     { $or: [{ userName: reported }, { userId: reported }] },
@@ -3064,48 +3094,31 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("report_user", async (data) => {
+  socket.on("report_user", async (data, ack) => {
+    const reply = (result) => {
+      if (typeof ack === "function") ack(result);
+      else socket.emit("report_result", result);
+    };
     try {
       const reporterId = socket.data.userName;
       const reportedUserId = normalizeName(
-        data?.reportedUserId ||
-        data?.partnerId ||
-        data?.toId
+        data?.reportedUserId || data?.partnerId || data?.toId
       );
-
       if (!reporterId || !reportedUserId) {
-        return socket.emit("report_result", {
-          success: false,
-          message: "Invalid report data"
+        return reply({ success: false, message: "Invalid report data" });
+      }
+      const result = await processUserReport(reporterId, reportedUserId, data);
+      reply({ ...result, message: result.success
+        ? (result.alreadyReported ? "Already reported" : "Report submitted successfully")
+        : result.message });
+      if (result.success) {
+        logInfo("REPORT", "User reported via socket", {
+          reporterId, reportedUserId, alreadyReported: !!result.alreadyReported
         });
       }
-
-      const result = await processUserReport(reporterId, reportedUserId);
-
-      if (!result.success) {
-        return socket.emit("report_result", result);
-      }
-
-      socket.emit("report_result", {
-        success: true,
-        message: "Report submitted successfully",
-        reports: result.reports,
-        reportedUserId: result.reportedUserId,
-        ban: result.ban || null
-      });
-
-      logInfo("REPORT", "User reported via socket", {
-        reporterId,
-        reportedUserId,
-        reports: result.reports,
-        ban: result.ban || null
-      });
     } catch (err) {
       logInfo("ERROR", "Socket report_user failed", err);
-      socket.emit("report_result", {
-        success: false,
-        message: "Failed to submit report"
-      });
+      reply({ success: false, message: "Failed to submit report" });
     }
   });
 
@@ -5134,7 +5147,7 @@ app.post("/report-user", async (req, res) => {
   try {
     const { reporterId, reportedUserId } = req.body;
 
-    const result = await processUserReport(reporterId, reportedUserId);
+    const result = await processUserReport(reporterId, reportedUserId, req.body);
 
     if (!result.success) {
       return res.status(400).json(result);
