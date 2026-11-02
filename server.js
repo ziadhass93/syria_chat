@@ -2673,6 +2673,44 @@ function metersToKmText(meters) {
 
   return `${km.toFixed(1)} كم`;
 }
+// Public Nearby details only; never expose either user's coordinates.
+function buildNearbyUserDetails(user, viewer) {
+  const details = {
+    country: user.country || "",
+    age: user.age ?? null,
+    bio: user.bio || "",
+    gender: user.gender || "unspecified"
+  };
+  const validLocation = (value) =>
+    value &&
+    typeof value.latitude === "number" &&
+    typeof value.longitude === "number" &&
+    Number.isFinite(value.latitude) &&
+    Number.isFinite(value.longitude) &&
+    Math.abs(value.latitude) <= 90 &&
+    Math.abs(value.longitude) <= 180;
+
+  if (validLocation(user) && validLocation(viewer)) {
+    const distanceMeters = haversineDistanceMeters(
+      viewer.latitude, viewer.longitude, user.latitude, user.longitude
+    );
+    details.distanceMeters = distanceMeters;
+    details.distanceKm = Number((distanceMeters / 1000).toFixed(2));
+    details.distanceText = metersToKmText(distanceMeters);
+  }
+  return details;
+}
+
+async function getNearbyRequestDetails(senderName, recipientName) {
+  const findUser = (name) => User.findOne({
+    $or: [{ userName: normalizeName(name) }, { userId: normalizeName(name) }]
+  }).select("country age bio gender latitude longitude").lean();
+  const [sender, recipient] = await Promise.all([
+    findUser(senderName), findUser(recipientName)
+  ]);
+  return sender ? buildNearbyUserDetails(sender, recipient) : {};
+}
+
 async function getNearbyUsersForUser(userName, maxDistanceMeters = 3000000, limit = 10) {
   const me = normalizeName(userName);
   if (!me) return [];
@@ -2706,17 +2744,12 @@ const users = await User.find({
     { isBanned: { $ne: true } }
   ]
 })
-   .select("userId userName displayName profileImage latitude longitude online lastSeen locationUpdatedAt")
+   .select("userId userName displayName profileImage country age bio gender latitude longitude online lastSeen locationUpdatedAt")
     .lean();
 
   return users
     .map((user) => {
-      const distanceMeters = haversineDistanceMeters(
-        currentUser.latitude,
-        currentUser.longitude,
-        user.latitude,
-        user.longitude
-      );
+      const details = buildNearbyUserDetails(user, currentUser);
 
      return {
   userId: publicUserId(user),
@@ -2724,9 +2757,7 @@ const users = await User.find({
   displayName: publicDisplayName(user),
   profileImage: sanitizeProfileImage(user.profileImage),
 
-  distanceMeters,
-  distanceKm: Number((distanceMeters / 1000).toFixed(2)),
-  distanceText: metersToKmText(distanceMeters),
+  ...details,
 
   online: user.online === true,
   lastSeen: user.lastSeen || null
@@ -2734,7 +2765,7 @@ const users = await User.find({
     })
    .filter((user) => {
   const id = normalizeName(user.userId || user.userName);
-  return user.distanceMeters <= maxDistanceMeters && !blockedIds.has(id);
+  return Number.isFinite(user.distanceMeters) && user.distanceMeters <= maxDistanceMeters && !blockedIds.has(id);
 })
    .sort((a, b) => a.distanceMeters - b.distanceMeters)
 .slice(0, limit);
@@ -3662,6 +3693,7 @@ if (!partner) return;
 
 deleteFriendRequestAfter10Minutes(friendRequest._id);
         await emitToUser(targetId, "new_friend_request", {
+          ...await getNearbyRequestDetails(me, targetId),
           from: myProfile?.userName || me,
           fromId: me,
           profileImage: myProfile?.profileImage || ""
@@ -4892,6 +4924,7 @@ const nearbyUsers = await getNearbyUsersForUser(me, maxDistanceMeters, limit);
 deleteFriendRequestAfter10Minutes(friendRequest._id);
 
     await emitToUser(targetId, "nearby_friend_request_received", {
+          ...await getNearbyRequestDetails(me, targetId),
       from: myProfile?.userName || me,
       fromId: me,
       userId: me,
